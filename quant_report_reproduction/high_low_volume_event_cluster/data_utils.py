@@ -1,82 +1,263 @@
 """
-数据工具模块
+数据工具模块 — 基于 akshare 获取真实 A 股数据
 
-提供数据加载、模拟数据生成、股票池管理等功能。
-由于原研报使用 Wind/通联数据（付费），本模块提供：
-1. 模拟数据生成器（用于验证方法论正确性）
-2. 通用数据接口（可替换为实际数据源）
+数据源:
+- akshare: 免费 A 股数据（日频 OHLCV）
+- 中证 800 成份股 (000906.SH)
+
+研报参数:
+- 回测区间: 2016/01/01 - 2025/10/31
+- 股票池: 中证 800 成份股
+- 基准: 中证 800 等权指数
 """
 
+import os
+import time
 import numpy as np
 import pandas as pd
+import akshare as ak
 from typing import Optional, Tuple, List
+from tqdm import tqdm
 
 
-def generate_simulated_daily_data(
-    n_stocks: int = 200,
-    n_days: int = 2400,
-    start_date: str = "2016-01-04",
-    seed: int = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+CACHE_DIR = "/workspace/quant_report_reproduction/data_cache"
+
+
+def _ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def get_csi800_constituents() -> List[str]:
+    """获取中证800当前成份股代码列表"""
+    cache_path = os.path.join(CACHE_DIR, "csi800_constituents.csv")
+    _ensure_cache_dir()
+
+    if os.path.exists(cache_path):
+        df = pd.read_csv(cache_path, dtype=str)
+        return df["code"].tolist()
+
+    df = ak.index_stock_cons(symbol="000906")
+    codes = df["品种代码"].tolist()
+
+    pd.DataFrame({"code": codes}).to_csv(cache_path, index=False)
+    return codes
+
+
+def fetch_stock_daily(
+    code: str,
+    start_date: str = "20150601",
+    end_date: str = "20251031",
+    max_retries: int = 3,
+) -> Optional[pd.DataFrame]:
     """
-    生成模拟日频数据（收盘价、成交量、开盘价）
+    获取单只股票日频数据（前复权），带重试
+    """
+    for attempt in range(max_retries):
+        try:
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq"
+            )
+            if df is None or len(df) == 0:
+                return None
+
+            df = df.rename(columns={
+                "日期": "date", "开盘": "open", "收盘": "close",
+                "最高": "high", "最低": "low",
+                "成交量": "volume", "成交额": "amount",
+                "换手率": "turnover",
+            })
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            df = df[["open", "close", "high", "low", "volume", "amount"]].astype(float)
+            return df
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 + attempt * 2)
+            else:
+                return None
+
+
+def fetch_all_stocks_daily(
+    stock_list: List[str],
+    start_date: str = "20150601",
+    end_date: str = "20251031",
+    cache_name: str = "csi800_daily",
+    sleep_interval: float = 0.2,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    批量获取股票日频数据，支持缓存
 
     Returns:
-        close_df: 收盘价 DataFrame (index=date, columns=stock_codes)
-        volume_df: 成交量 DataFrame
-        open_df: 开盘价 DataFrame
+        close_df, volume_df, open_df, amount_df
     """
-    rng = np.random.default_rng(seed)
+    _ensure_cache_dir()
+    cache_prefix = os.path.join(CACHE_DIR, cache_name)
 
-    dates = pd.bdate_range(start=start_date, periods=n_days, freq="B")
-    stock_codes = [f"SH{600000 + i:06d}" for i in range(n_stocks)]
+    close_path = f"{cache_prefix}_close.csv"
+    volume_path = f"{cache_prefix}_volume.csv"
+    open_path = f"{cache_prefix}_open.csv"
+    amount_path = f"{cache_prefix}_amount.csv"
 
-    mu = rng.uniform(-0.0002, 0.0005, size=n_stocks)
-    sigma = rng.uniform(0.015, 0.035, size=n_stocks)
+    if all(os.path.exists(p) for p in [close_path, volume_path, open_path, amount_path]):
+        print("Loading cached data...")
+        close_df = pd.read_csv(close_path, index_col=0, parse_dates=True)
+        volume_df = pd.read_csv(volume_path, index_col=0, parse_dates=True)
+        open_df = pd.read_csv(open_path, index_col=0, parse_dates=True)
+        amount_df = pd.read_csv(amount_path, index_col=0, parse_dates=True)
+        print(f"  Loaded {close_df.shape[1]} stocks, {len(close_df)} days")
+        return close_df, volume_df, open_df, amount_df
 
-    daily_returns = rng.normal(
-        loc=mu, scale=sigma, size=(n_days, n_stocks)
-    )
-    market_factor = rng.normal(0, 0.012, size=(n_days, 1))
-    daily_returns += market_factor * 0.6
+    print(f"Fetching daily data for {len(stock_list)} stocks...")
+    all_close = {}
+    all_volume = {}
+    all_open = {}
+    all_amount = {}
 
-    init_prices = rng.uniform(5, 50, size=n_stocks)
-    close_prices = init_prices * np.exp(np.cumsum(daily_returns, axis=0))
+    for i, code in enumerate(tqdm(stock_list, desc="Fetching stocks")):
+        df = fetch_stock_daily(code, start_date, end_date)
+        if df is not None and len(df) > 100:
+            all_close[code] = df["close"]
+            all_volume[code] = df["volume"]
+            all_open[code] = df["open"]
+            all_amount[code] = df["amount"]
 
-    base_volume = rng.uniform(5e6, 5e7, size=n_stocks)
-    volume_noise = rng.lognormal(0, 0.5, size=(n_days, n_stocks))
-    volume = base_volume * volume_noise
+        time.sleep(sleep_interval)
 
-    abs_ret = np.abs(daily_returns)
-    volume *= (1 + abs_ret * 10)
+    close_df = pd.DataFrame(all_close)
+    volume_df = pd.DataFrame(all_volume)
+    open_df = pd.DataFrame(all_open)
+    amount_df = pd.DataFrame(all_amount)
 
-    open_noise = rng.normal(0, 0.003, size=(n_days, n_stocks))
-    open_prices = close_prices * np.exp(open_noise)
+    close_df.to_csv(close_path)
+    volume_df.to_csv(volume_path)
+    open_df.to_csv(open_path)
+    amount_df.to_csv(amount_path)
 
-    close_df = pd.DataFrame(close_prices, index=dates, columns=stock_codes)
-    volume_df = pd.DataFrame(volume, index=dates, columns=stock_codes)
-    open_df = pd.DataFrame(open_prices, index=dates, columns=stock_codes)
+    print(f"  Fetched {close_df.shape[1]} stocks, {len(close_df)} days")
+    print(f"  Data cached to {cache_prefix}_*.parquet")
 
-    return close_df, volume_df, open_df
+    return close_df, volume_df, open_df, amount_df
 
 
-def generate_simulated_minute_data(
+def fetch_csi800_index_daily(
+    start_date: str = "20150601",
+    end_date: str = "20251031",
+) -> pd.DataFrame:
+    """获取中证800指数日频数据"""
+    cache_path = os.path.join(CACHE_DIR, "csi800_index_daily.csv")
+    _ensure_cache_dir()
+
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path, index_col=0, parse_dates=True)
+
+    df = ak.stock_zh_index_daily(symbol="sh000906")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")
+    df = df.loc[start_date:end_date]
+    df.to_csv(cache_path)
+    return df
+
+
+def prepare_real_data(
+    n_stocks: int = 50,
+    start_date: str = "20150601",
+    end_date: str = "20251031",
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
+    """
+    准备真实数据的主入口（从缓存加载）
+    """
+    _ensure_cache_dir()
+    cache_prefix = os.path.join(CACHE_DIR, "csi800_daily")
+
+    close_path = f"{cache_prefix}_close.csv"
+    volume_path = f"{cache_prefix}_volume.csv"
+    open_path = f"{cache_prefix}_open.csv"
+    amount_path = f"{cache_prefix}_amount.csv"
+
+    if all(os.path.exists(p) for p in [close_path, volume_path, open_path, amount_path]):
+        print("Loading cached real data...")
+        close_df = pd.read_csv(close_path, index_col=0, parse_dates=True)
+        volume_df = pd.read_csv(volume_path, index_col=0, parse_dates=True)
+        open_df = pd.read_csv(open_path, index_col=0, parse_dates=True)
+        amount_df = pd.read_csv(amount_path, index_col=0, parse_dates=True)
+    else:
+        raise FileNotFoundError(
+            "Data cache not found. Run download_data.py first to fetch data."
+        )
+
+    close_df = close_df.loc["2016-01-01":"2025-10-31"]
+    volume_df = volume_df.loc["2016-01-01":"2025-10-31"]
+    open_df = open_df.loc["2016-01-01":"2025-10-31"]
+    amount_df = amount_df.loc["2016-01-01":"2025-10-31"]
+
+    close_df = close_df.dropna(axis=1, thresh=int(len(close_df) * 0.8))
+    common_stocks = close_df.columns
+    volume_df = volume_df[common_stocks]
+    open_df = open_df[common_stocks]
+    amount_df = amount_df[common_stocks]
+
+    close_df = close_df.ffill().bfill()
+    volume_df = volume_df.ffill().bfill()
+    open_df = open_df.ffill().bfill()
+    amount_df = amount_df.ffill().bfill()
+
+    if n_stocks < len(close_df.columns):
+        stocks = close_df.columns[:n_stocks].tolist()
+        close_df = close_df[stocks]
+        volume_df = volume_df[stocks]
+        open_df = open_df[stocks]
+        amount_df = amount_df[stocks]
+
+    benchmark_returns = get_benchmark_returns(close_df)
+
+    print(f"  Loaded {close_df.shape[1]} stocks, {len(close_df)} trading days")
+    print(f"  Date range: {close_df.index[0].date()} to {close_df.index[-1].date()}")
+
+    return close_df, volume_df, open_df, amount_df, benchmark_returns
+
+
+def get_benchmark_returns(
+    close_df: pd.DataFrame,
+    method: str = "equal_weight",
+) -> pd.Series:
+    """计算等权基准收益率"""
+    daily_returns = close_df.pct_change()
+    if method == "equal_weight":
+        benchmark = daily_returns.mean(axis=1)
+    else:
+        benchmark = daily_returns.mean(axis=1)
+    benchmark.name = "benchmark"
+    return benchmark
+
+
+def get_trading_calendar(close_df: pd.DataFrame) -> pd.DatetimeIndex:
+    return close_df.index
+
+
+def get_weekly_rebalance_dates(trading_calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    dates = pd.Series(trading_calendar)
+    week_end = dates.groupby(dates.dt.isocalendar().week).last()
+    return pd.DatetimeIndex(week_end.values)
+
+
+# ============================================================
+# 分钟级数据模拟（基于真实日频数据特征生成）
+# ============================================================
+
+def generate_realistic_minute_data(
     daily_close: pd.Series,
     daily_volume: pd.Series,
+    daily_high: Optional[pd.Series] = None,
+    daily_low: Optional[pd.Series] = None,
     n_minutes: int = 240,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    基于日频数据生成单只股票某日的模拟分钟数据
+    基于真实日频数据特征生成分钟级数据
 
-    Args:
-        daily_close: 该股票的日频收盘价 Series (index=date)
-        daily_volume: 该股票的日频成交量 Series (index=date)
-        n_minutes: 每日分钟数
-
-    Returns:
-        minute_close: 分钟收盘价 DataFrame (index=date, columns=minute_idx)
-        minute_volume: 分钟成交量 DataFrame
+    使用真实的 OHLCV 约束来生成合理的日内分布，
+    保证分钟级价格波动与真实日频 high/low/close 一致。
     """
     rng = np.random.default_rng(seed)
     n_days = len(daily_close)
@@ -88,20 +269,42 @@ def generate_simulated_minute_data(
         prev_close = daily_close.iloc[i - 1] if i > 0 else daily_close.iloc[0] * 0.99
         target_close = daily_close.iloc[i]
 
+        if daily_high is not None and daily_low is not None:
+            day_high = daily_high.iloc[i]
+            day_low = daily_low.iloc[i]
+        else:
+            day_range = abs(target_close - prev_close) * 2
+            day_high = max(prev_close, target_close) + day_range * 0.3
+            day_low = min(prev_close, target_close) - day_range * 0.3
+
+        if np.isnan(target_close) or np.isnan(prev_close) or prev_close <= 0:
+            minute_close_list.append(np.full(n_minutes, np.nan))
+            minute_volume_list.append(np.full(n_minutes, np.nan))
+            continue
+
         drift = np.log(target_close / prev_close) / n_minutes
-        noise = rng.normal(0, 0.001, size=n_minutes)
+        intraday_vol = abs(np.log(day_high / max(day_low, 0.01))) / (4 * np.sqrt(n_minutes))
+        if intraday_vol < 1e-6:
+            intraday_vol = 0.001
+
+        noise = rng.normal(0, intraday_vol, size=n_minutes)
         returns = drift + noise
 
         minute_prices = prev_close * np.exp(np.cumsum(returns))
         scale_factor = target_close / minute_prices[-1]
         minute_prices *= scale_factor
 
+        minute_prices = np.clip(minute_prices, day_low * 0.98, day_high * 1.02)
+
         total_vol = daily_volume.iloc[i]
+        if np.isnan(total_vol) or total_vol <= 0:
+            total_vol = 1e6
+
         u_shape = np.array([
-            1.5 - 0.8 * np.sin(np.pi * j / n_minutes)
+            1.8 - 1.0 * np.sin(np.pi * j / n_minutes) + 0.5 * np.exp(-j / 10) + 0.5 * np.exp(-(n_minutes - j) / 20)
             for j in range(n_minutes)
         ])
-        vol_noise = rng.lognormal(0, 0.3, size=n_minutes)
+        vol_noise = rng.lognormal(0, 0.4, size=n_minutes)
         raw_vol = u_shape * vol_noise
         minute_vol = raw_vol / raw_vol.sum() * total_vol
 
@@ -118,70 +321,3 @@ def generate_simulated_minute_data(
     )
 
     return minute_close, minute_volume
-
-
-def generate_batch_minute_data(
-    close_df: pd.DataFrame,
-    volume_df: pd.DataFrame,
-    stock_list: Optional[List[str]] = None,
-    n_minutes: int = 240,
-    seed: int = 42,
-) -> Tuple[dict, dict]:
-    """
-    批量生成多只股票的分钟数据
-
-    Returns:
-        minute_close_dict: {stock_code: minute_close_df}
-        minute_volume_dict: {stock_code: minute_volume_df}
-    """
-    if stock_list is None:
-        stock_list = close_df.columns.tolist()
-
-    minute_close_dict = {}
-    minute_volume_dict = {}
-
-    for idx, stock in enumerate(stock_list):
-        mc, mv = generate_simulated_minute_data(
-            close_df[stock], volume_df[stock],
-            n_minutes=n_minutes, seed=seed + idx
-        )
-        minute_close_dict[stock] = mc
-        minute_volume_dict[stock] = mv
-
-    return minute_close_dict, minute_volume_dict
-
-
-def get_benchmark_returns(
-    close_df: pd.DataFrame,
-    method: str = "equal_weight",
-) -> pd.Series:
-    """
-    计算基准指数收益率
-
-    Args:
-        close_df: 股票收盘价 DataFrame
-        method: 'equal_weight' = 等权指数
-    """
-    daily_returns = close_df.pct_change()
-    if method == "equal_weight":
-        benchmark = daily_returns.mean(axis=1)
-    else:
-        benchmark = daily_returns.mean(axis=1)
-    benchmark.name = "benchmark"
-    return benchmark
-
-
-def get_trading_calendar(
-    close_df: pd.DataFrame,
-) -> pd.DatetimeIndex:
-    """获取交易日历"""
-    return close_df.index
-
-
-def get_weekly_rebalance_dates(
-    trading_calendar: pd.DatetimeIndex,
-) -> pd.DatetimeIndex:
-    """获取每周末（周五）的调仓日期"""
-    dates = pd.Series(trading_calendar)
-    week_end = dates.groupby(dates.dt.isocalendar().week).last()
-    return pd.DatetimeIndex(week_end.values)
