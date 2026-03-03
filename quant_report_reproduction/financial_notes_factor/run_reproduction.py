@@ -38,11 +38,25 @@ def header(title):
 
 def load_data():
     header("Step 1: Loading Real Price Data")
-    close_df = pd.read_csv(f"{CACHE}/csi800_daily_close.csv", index_col=0, parse_dates=True)
-    volume_df = pd.read_csv(f"{CACHE}/csi800_daily_volume.csv", index_col=0, parse_dates=True)
-    close_df = close_df.loc["2014-06-30":"2025-10-31"].ffill().bfill()
-    volume_df = volume_df.loc["2014-06-30":"2025-10-31"].ffill().bfill()
-    close_df = close_df.dropna(axis=1, thresh=int(len(close_df) * 0.8))
+    # Priority: DataYes > YFinance
+    datayes = f"{CACHE}/datayes_daily_close.csv"
+    yf = f"{CACHE}/csi800_daily_close.csv"
+
+    if os.path.exists(datayes):
+        prefix = f"{CACHE}/datayes_daily"
+        source = "DataYes (通联数据)"
+    elif os.path.exists(yf):
+        prefix = f"{CACHE}/csi800_daily"
+        source = "YFinance"
+    else:
+        raise FileNotFoundError("No data cache found")
+
+    print(f"  Source: {source}")
+    close_df = pd.read_csv(f"{prefix}_close.csv", index_col=0, parse_dates=True)
+    volume_df = pd.read_csv(f"{prefix}_volume.csv", index_col=0, parse_dates=True)
+    close_df = close_df.ffill().bfill()
+    volume_df = volume_df.ffill().bfill()
+    close_df = close_df.dropna(axis=1, thresh=int(len(close_df) * 0.5))
     volume_df = volume_df[close_df.columns]
     print(f"  Stocks: {close_df.shape[1]}, Days: {len(close_df)}")
     print(f"  Range: {close_df.index[0].date()} to {close_df.index[-1].date()}")
@@ -114,14 +128,17 @@ def main():
     monthly_dates = monthly_returns.index
     total_stocks = close_df.shape[1]
 
-    semi_annual_dates = generate_report_dates("2014-06-30", "2025-10-31", "semi_annual")
-    annual_dates = generate_report_dates("2014-06-30", "2025-10-31", "annual")
+    data_start = str(close_df.index[0].date())
+    data_end = str(close_df.index[-1].date())
+    semi_annual_dates = generate_report_dates(data_start, data_end, "semi_annual")
+    annual_dates = generate_report_dates(data_start, data_end, "annual")
 
     # === Factor 1: Foreign Currency Ratio ===
     header("Step 2: Foreign Currency Ratio Factor")
     f1_raw = simulate_foreign_currency_data(close_df, volume_df, semi_annual_dates, seed=42)
     f1_monthly = expand_factor_to_monthly(f1_raw, monthly_dates)
-    f1_monthly = f1_monthly.loc["2017-04-30":]
+    factor_start = f1_monthly.dropna(how="all").index[0] if len(f1_monthly.dropna(how="all")) > 0 else f1_monthly.index[0]
+    f1_monthly = f1_monthly.loc[factor_start:]
     mr1 = monthly_returns.loc[f1_monthly.index[0]:]
     m1 = test_single_factor("Foreign Currency Ratio", f1_monthly, mr1, total_stocks)
 
@@ -129,7 +146,8 @@ def main():
     header("Step 3: Overseas Revenue Stability Factor")
     f2_raw = simulate_overseas_revenue_data(close_df, volume_df, semi_annual_dates, seed=123)
     f2_monthly = expand_factor_to_monthly(f2_raw, monthly_dates)
-    f2_monthly = f2_monthly.loc["2017-04-30":]
+    factor_start2 = f2_monthly.dropna(how="all").index[0] if len(f2_monthly.dropna(how="all")) > 0 else f2_monthly.index[0]
+    f2_monthly = f2_monthly.loc[factor_start2:]
     mr2 = monthly_returns.loc[f2_monthly.index[0]:]
     m2 = test_single_factor("Overseas Revenue Stability", f2_monthly, mr2, total_stocks)
 
@@ -137,7 +155,8 @@ def main():
     header("Step 4: Customer Concentration Stability Factor")
     f3_raw = simulate_customer_stability_data(close_df, volume_df, annual_dates, seed=456)
     f3_monthly = expand_factor_to_monthly(f3_raw, monthly_dates)
-    f3_monthly = f3_monthly.loc["2017-04-30":]
+    factor_start3 = f3_monthly.dropna(how="all").index[0] if len(f3_monthly.dropna(how="all")) > 0 else f3_monthly.index[0]
+    f3_monthly = f3_monthly.loc[factor_start3:]
     f3_monthly = -f3_monthly  # negative factor
     mr3 = monthly_returns.loc[f3_monthly.index[0]:]
     m3 = test_single_factor("Customer Stability", f3_monthly, mr3, total_stocks)
@@ -147,14 +166,16 @@ def main():
     composite_3 = composite_factors({
         "f1": f1_monthly, "f2": f2_monthly, "f3": f3_monthly
     })
-    composite_3 = composite_3.loc["2017-04-30":]
+    cs3 = composite_3.dropna(how="all").index[0] if len(composite_3.dropna(how="all")) > 0 else composite_3.index[0]
+    composite_3 = composite_3.loc[cs3:]
     mr_c = monthly_returns.loc[composite_3.index[0]:]
     m_c3 = test_single_factor("3-Factor Composite", composite_3, mr_c, total_stocks)
 
     # === 2-Factor Composite (F1 + F3, higher coverage) ===
     header("Step 6: 2-Factor Composite (Currency + Customer)")
     composite_2 = composite_factors({"f1": f1_monthly, "f3": f3_monthly})
-    composite_2 = composite_2.loc["2017-04-30":]
+    cs2 = composite_2.dropna(how="all").index[0] if len(composite_2.dropna(how="all")) > 0 else composite_2.index[0]
+    composite_2 = composite_2.loc[cs2:]
     m_c2 = test_single_factor("2-Factor Composite", composite_2, mr_c, total_stocks)
 
     # === Summary Comparison ===

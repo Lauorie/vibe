@@ -160,36 +160,45 @@ def fetch_csi800_index_daily(
 
 
 def prepare_real_data(
-    n_stocks: int = 50,
+    n_stocks: int = 200,
     start_date: str = "20150601",
     end_date: str = "20251031",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
     """
-    准备真实数据的主入口（从缓存加载）
+    准备真实数据（优先通联数据，回退到 yfinance）
     """
     _ensure_cache_dir()
-    cache_prefix = os.path.join(CACHE_DIR, "csi800_daily")
 
-    close_path = f"{cache_prefix}_close.csv"
-    volume_path = f"{cache_prefix}_volume.csv"
-    open_path = f"{cache_prefix}_open.csv"
-    amount_path = f"{cache_prefix}_amount.csv"
+    # Priority: DataYes (200 stocks) > YFinance (50 stocks)
+    datayes_close = os.path.join(CACHE_DIR, "datayes_daily_close.csv")
+    yf_close = os.path.join(CACHE_DIR, "csi800_daily_close.csv")
 
-    if all(os.path.exists(p) for p in [close_path, volume_path, open_path, amount_path]):
-        print("Loading cached real data...")
-        close_df = pd.read_csv(close_path, index_col=0, parse_dates=True)
-        volume_df = pd.read_csv(volume_path, index_col=0, parse_dates=True)
-        open_df = pd.read_csv(open_path, index_col=0, parse_dates=True)
-        amount_df = pd.read_csv(amount_path, index_col=0, parse_dates=True)
+    if os.path.exists(datayes_close):
+        prefix = os.path.join(CACHE_DIR, "datayes_daily")
+        source = "DataYes (通联数据)"
+    elif os.path.exists(yf_close):
+        prefix = os.path.join(CACHE_DIR, "csi800_daily")
+        source = "YFinance"
     else:
-        raise FileNotFoundError(
-            "Data cache not found. Run download_data.py first to fetch data."
-        )
+        raise FileNotFoundError("No data cache found. Run download script first.")
 
-    close_df = close_df.loc["2016-01-01":"2025-10-31"]
-    volume_df = volume_df.loc["2016-01-01":"2025-10-31"]
-    open_df = open_df.loc["2016-01-01":"2025-10-31"]
-    amount_df = amount_df.loc["2016-01-01":"2025-10-31"]
+    close_path = f"{prefix}_close.csv"
+    volume_path = f"{prefix}_volume.csv"
+    open_path = f"{prefix}_open.csv"
+    amount_path = f"{prefix}_amount.csv"
+
+    print(f"Loading data from {source}...")
+    close_df = pd.read_csv(close_path, index_col=0, parse_dates=True)
+    volume_df = pd.read_csv(volume_path, index_col=0, parse_dates=True)
+    open_df = pd.read_csv(open_path, index_col=0, parse_dates=True)
+    amount_df = pd.read_csv(amount_path, index_col=0, parse_dates=True)
+
+    data_start = close_df.index[0]
+    data_end = close_df.index[-1]
+    close_df = close_df.loc[data_start:data_end]
+    volume_df = volume_df.loc[data_start:data_end]
+    open_df = open_df.loc[data_start:data_end]
+    amount_df = amount_df.loc[data_start:data_end]
 
     close_df = close_df.dropna(axis=1, thresh=int(len(close_df) * 0.8))
     common_stocks = close_df.columns
