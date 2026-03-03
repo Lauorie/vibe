@@ -1,190 +1,147 @@
 """
-三个财务附注经营结构因子实现
+三个财务附注经营结构因子 — 基于通联数据真实财务报表
 
-1. 外币资金占货币资金比（截面）: factor = 1 - RMB_cash / total_cash
-2. 境外业务收入占比稳定性（时序）: factor = ratio / std(ratio)_{t=1,...,6}
-3. 主要客户销售收入占比稳定性（时序）: factor = std(top1_ratio)_{t=1,...,3}
+因子定义（原文）:
+1. 外币资金占货币资金比 = 1 - RMB_cash / total_cash
+2. 境外收入占比稳定性 = ratio / std(ratio)_{t=1,...,6}
+3. 主要客户销售收入占比稳定性 = std(top1_ratio)_{t=1,...,3}
 
-由于财务附注数据仅在 Wind 等专业终端可获取，本模块提供：
-- 完整的因子计算逻辑
-- 基于公司特征的合理模拟数据生成
+由于通联数据主表不直接提供"外币资金币种明细"和"境外收入地区拆分"等
+附注级字段（需Wind终端），本模块使用真实财务数据构建等效代理因子:
+1. 代理因子1: 经营活动现金流/货币资金 (现金充裕度，类似外币资金反映的境外经营强度)
+2. 代理因子2: 营业收入/总资产 稳定性 (收入资产比稳定性，反映收入结构的稳健程度)
+3. 代理因子3: 毛利率波动率 (经营结构稳定性，反映主要客户/产品结构的稳定)
 """
 
 import numpy as np
 import pandas as pd
-from typing import Tuple, Optional
+import os
+from typing import Optional
+
+CACHE = "/workspace/quant_report_reproduction/data_cache"
+
+
+def load_real_financial_data():
+    """加载通联数据真实财务报表"""
+    bs = pd.read_csv(f"{CACHE}/datayes_bs.csv")
+    is_ = pd.read_csv(f"{CACHE}/datayes_is.csv")
+    cf = pd.read_csv(f"{CACHE}/datayes_cf.csv")
+    return bs, is_, cf
+
+
+def _pivot_financial(df, value_col, date_col="endDate", id_col="secID"):
+    """将长表转为宽表 (index=endDate, columns=secID)"""
+    if value_col not in df.columns:
+        return pd.DataFrame()
+    sub = df[[id_col, date_col, value_col]].dropna(subset=[value_col])
+    sub = sub.drop_duplicates(subset=[id_col, date_col], keep="last")
+    pivot = sub.pivot(index=date_col, columns=id_col, values=value_col)
+    pivot.index = pd.to_datetime(pivot.index)
+    return pivot.sort_index()
 
 
 # ============================================================
-# Factor 1: 外币资金占货币资金比
+# Factor 1: 现金充裕度因子 (代理外币资金占比)
 # ============================================================
 
-def calc_foreign_currency_ratio(
-    rmb_cash: pd.DataFrame,
-    total_cash: pd.DataFrame,
-) -> pd.DataFrame:
+def calc_factor1_cash_intensity(bs_df, cf_df):
     """
-    计算外币资金占货币资金比
+    因子1: 经营现金流 / 货币资金
 
-    factor = 1 - RMB_cash / total_cash
-    大于1的值clip为1
+    经济逻辑: 原文的"外币资金占比"反映境外经营强度。
+    作为代理, 我们用"经营活动现金流入/货币资金"来衡量现金的活跃程度,
+    高比值说明公司现金周转活跃、经营强度高。
+
+    使用真实数据: cashCEquiv(货币资金) 来自资产负债表,
+    CFrSaleGS(销售商品提供劳务收到的现金) 来自现金流量表
     """
-    ratio = 1 - rmb_cash / total_cash
-    ratio = ratio.clip(upper=1.0)
-    return ratio
+    cash = _pivot_financial(bs_df, "cashCEquiv")
+    if "CFrSaleGS" in cf_df.columns:
+        cf_sales = _pivot_financial(cf_df, "CFrSaleGS")
+    else:
+        return pd.DataFrame()
 
+    common = cash.columns.intersection(cf_sales.columns)
+    common_dates = cash.index.intersection(cf_sales.index)
 
-def simulate_foreign_currency_data(
-    close_df: pd.DataFrame,
-    volume_df: pd.DataFrame,
-    report_dates: pd.DatetimeIndex,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """
-    基于股票特征模拟外币资金占比因子
+    if len(common) == 0 or len(common_dates) == 0:
+        return pd.DataFrame()
 
-    逻辑：大市值、高成交额的公司更可能有境外业务，外币占比更高。
-    半年更新（4月末、8月末），覆盖度约80%。
-    """
-    rng = np.random.default_rng(seed)
-    stocks = close_df.columns
-    n_stocks = len(stocks)
-
-    avg_volume = volume_df.mean()
-    vol_rank = avg_volume.rank(pct=True)
-
-    factor_dict = {}
-    for date in report_dates:
-        base = vol_rank.values * 0.3 + rng.beta(2, 5, size=n_stocks) * 0.5
-        base = np.clip(base, 0, 1)
-
-        mask = rng.random(n_stocks) < 0.80
-        values = pd.Series(np.where(mask, base, np.nan), index=stocks)
-        factor_dict[date] = values
-
-    return pd.DataFrame(factor_dict).T
+    factor = cf_sales.loc[common_dates, common] / cash.loc[common_dates, common].replace(0, np.nan)
+    factor = factor.clip(-10, 10)
+    return factor
 
 
 # ============================================================
-# Factor 2: 境外业务收入占比稳定性
+# Factor 2: 收入结构稳定性因子 (代理境外收入占比稳定性)
 # ============================================================
 
-def calc_overseas_revenue_stability(
-    overseas_revenue_ratio: pd.DataFrame,
-    lookback_periods: int = 6,
-) -> pd.DataFrame:
+def calc_factor2_revenue_stability(bs_df, is_df):
     """
-    计算境外业务收入占比稳定性
+    因子2: (revenue / TAssets) / std(revenue / TAssets)_{历史}
 
-    factor = ratio / std(ratio)_{t=1,...,lookback_periods}
+    经济逻辑: 原文的"境外收入占比稳定性"衡量收入结构的时序稳健性。
+    作为代理, 我们用"营业收入/总资产"的当期值除以历史波动率,
+    高比值说明收入资产效率高且稳定。
+
+    使用真实数据: revenue(营业收入) 来自利润表,
+    TAssets(总资产) 来自资产负债表
     """
-    ratio_std = overseas_revenue_ratio.rolling(
-        lookback_periods, min_periods=3
-    ).std()
-    factor = overseas_revenue_ratio / ratio_std
+    revenue = _pivot_financial(is_df, "revenue")
+    total_assets = _pivot_financial(bs_df, "TAssets")
+
+    common = revenue.columns.intersection(total_assets.columns)
+    common_dates = revenue.index.intersection(total_assets.index)
+
+    if len(common) == 0 or len(common_dates) == 0:
+        return pd.DataFrame()
+
+    ratio = revenue.loc[common_dates, common] / total_assets.loc[common_dates, common].replace(0, np.nan)
+    ratio_std = ratio.expanding(min_periods=2).std()
+    factor = ratio / ratio_std.replace(0, np.nan)
     factor = factor.replace([np.inf, -np.inf], np.nan)
+    factor = factor.clip(-20, 20)
     return factor
 
 
-def simulate_overseas_revenue_data(
-    close_df: pd.DataFrame,
-    volume_df: pd.DataFrame,
-    report_dates: pd.DatetimeIndex,
-    seed: int = 123,
-) -> pd.DataFrame:
-    """
-    模拟境外收入占比稳定性因子
-
-    逻辑：境外收入稳定的公司经营更稳健。覆盖度约40%。
-    """
-    rng = np.random.default_rng(seed)
-    stocks = close_df.columns
-    n_stocks = len(stocks)
-
-    base_ratio = rng.beta(2, 8, size=n_stocks)
-    stability = rng.uniform(0.3, 3.0, size=n_stocks)
-
-    factor_dict = {}
-    for i, date in enumerate(report_dates):
-        noise = rng.normal(0, 0.05, size=n_stocks)
-        current_ratio = np.clip(base_ratio + noise * (i % 4 - 1.5) * 0.1, 0, 1)
-        ratio_std = np.abs(rng.normal(0.05, 0.03, size=n_stocks))
-        ratio_std = np.clip(ratio_std, 0.01, None)
-        factor_vals = current_ratio / ratio_std * stability
-
-        mask = rng.random(n_stocks) < 0.40
-        values = pd.Series(np.where(mask, factor_vals, np.nan), index=stocks)
-        factor_dict[date] = values
-
-    return pd.DataFrame(factor_dict).T
-
-
 # ============================================================
-# Factor 3: 主要客户销售收入占比稳定性
+# Factor 3: 毛利率稳定性因子 (代理主要客户占比稳定性)
 # ============================================================
 
-def calc_customer_concentration_stability(
-    top1_customer_ratio: pd.DataFrame,
-    lookback_years: int = 3,
-) -> pd.DataFrame:
+def calc_factor3_margin_stability(is_df):
     """
-    计算主要客户销售收入占比稳定性
+    因子3: std(毛利率)_{历史3期}
 
-    factor = std(top1_ratio)_{t=1,...,lookback_years}
-    注意：这是负向因子（IC为负），std越低 → 越稳定 → 收益越好
+    经济逻辑: 原文的"主要客户销售收入占比稳定性"反映下游需求稳定性。
+    毛利率稳定是客户结构和产品结构稳定的直接体现——
+    如果主要客户/产品结构不变, 毛利率通常也稳定。
+
+    负向因子: std越低 = 越稳定 = 收益越好
+
+    使用真实数据: revenue(营业收入) 和 COGS(营业成本) 来自利润表
     """
-    factor = top1_customer_ratio.rolling(lookback_years, min_periods=2).std()
+    revenue = _pivot_financial(is_df, "revenue")
+    cogs = _pivot_financial(is_df, "COGS")
+
+    common = revenue.columns.intersection(cogs.columns)
+    common_dates = revenue.index.intersection(cogs.index)
+
+    if len(common) == 0 or len(common_dates) == 0:
+        return pd.DataFrame()
+
+    gross_margin = (revenue.loc[common_dates, common] - cogs.loc[common_dates, common]) / \
+                   revenue.loc[common_dates, common].replace(0, np.nan)
+
+    factor = gross_margin.expanding(min_periods=2).std()
     return factor
 
 
-def simulate_customer_stability_data(
-    close_df: pd.DataFrame,
-    volume_df: pd.DataFrame,
-    report_dates: pd.DatetimeIndex,
-    seed: int = 456,
-) -> pd.DataFrame:
-    """
-    模拟主要客户占比稳定性因子
-
-    逻辑：客户集中度越稳定，公司下游需求越稳定。
-    年度更新（8月末），覆盖度约60%。此为负向因子。
-    """
-    rng = np.random.default_rng(seed)
-    stocks = close_df.columns
-    n_stocks = len(stocks)
-
-    base_stability = rng.exponential(0.05, size=n_stocks)
-
-    factor_dict = {}
-    for i, date in enumerate(report_dates):
-        noise = rng.exponential(0.02, size=n_stocks)
-        factor_vals = base_stability + noise
-
-        mask = rng.random(n_stocks) < 0.60
-        values = pd.Series(np.where(mask, factor_vals, np.nan), index=stocks)
-        factor_dict[date] = values
-
-    return pd.DataFrame(factor_dict).T
-
-
 # ============================================================
-# Factor Composite
+# Utility functions
 # ============================================================
 
-def composite_factors(
-    factors: dict,
-    method: str = "equal_weight",
-) -> pd.DataFrame:
-    """
-    因子等权复合
-
-    Args:
-        factors: {name: factor_df}
-        method: 'equal_weight'
-
-    Returns:
-        composite factor DataFrame
-    """
+def composite_factors(factors: dict, method: str = "equal_weight") -> pd.DataFrame:
+    """因子等权复合（排名百分比标准化后等权）"""
     factor_list = list(factors.values())
 
     common_dates = factor_list[0].index
@@ -193,55 +150,36 @@ def composite_factors(
         common_dates = common_dates.intersection(f.index)
         common_stocks = common_stocks.intersection(f.columns)
 
+    if len(common_dates) == 0 or len(common_stocks) == 0:
+        return pd.DataFrame()
+
     standardized = []
     for f in factor_list:
         f_sub = f.loc[common_dates, common_stocks]
         f_rank = f_sub.rank(axis=1, pct=True)
         standardized.append(f_rank)
 
-    if method == "equal_weight":
-        composite = sum(standardized) / len(standardized)
-    else:
-        composite = sum(standardized) / len(standardized)
-
-    return composite
+    return sum(standardized) / len(standardized)
 
 
-def generate_report_dates(
-    start: str = "2014-06-30",
-    end: str = "2025-10-31",
-    freq: str = "semi_annual",
-) -> pd.DatetimeIndex:
-    """
-    生成财报发布日期
-
-    semi_annual: 每年 4月末 + 8月末
-    annual: 每年 8月末
-    """
+def generate_report_dates(start, end, freq="semi_annual"):
+    """生成财报发布日期"""
     dates = []
     for year in range(int(start[:4]), int(end[:4]) + 1):
         if freq == "semi_annual":
-            d1 = pd.Timestamp(f"{year}-04-30")
-            d2 = pd.Timestamp(f"{year}-08-31")
-            if d1 >= pd.Timestamp(start) and d1 <= pd.Timestamp(end):
-                dates.append(d1)
-            if d2 >= pd.Timestamp(start) and d2 <= pd.Timestamp(end):
-                dates.append(d2)
+            for m, d in [("04", "30"), ("08", "31")]:
+                dt = pd.Timestamp(f"{year}-{m}-{d}")
+                if dt >= pd.Timestamp(start) and dt <= pd.Timestamp(end):
+                    dates.append(dt)
         elif freq == "annual":
-            d = pd.Timestamp(f"{year}-08-31")
-            if d >= pd.Timestamp(start) and d <= pd.Timestamp(end):
-                dates.append(d)
+            dt = pd.Timestamp(f"{year}-08-31")
+            if dt >= pd.Timestamp(start) and dt <= pd.Timestamp(end):
+                dates.append(dt)
     return pd.DatetimeIndex(dates)
 
 
-def expand_factor_to_monthly(
-    factor: pd.DataFrame,
-    monthly_dates: pd.DatetimeIndex,
-) -> pd.DataFrame:
-    """
-    将半年/年度因子扩展到月频（前向填充）
-    """
-    factor_monthly = factor.reindex(
-        factor.index.union(monthly_dates)
-    ).sort_index().ffill()
-    return factor_monthly.reindex(monthly_dates)
+def expand_factor_to_monthly(factor, monthly_dates):
+    """半年/年度因子扩展到月频（前向填充）"""
+    combined = factor.index.union(monthly_dates)
+    expanded = factor.reindex(combined).sort_index().ffill()
+    return expanded.reindex(monthly_dates)
