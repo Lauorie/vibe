@@ -1,2 +1,3 @@
 QuantsPlaybook/
 __pycache__/
+*.pyc
